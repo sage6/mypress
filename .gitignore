@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# VitePress generated files
+.vitepress/dist/
+.vitepress/cache/
+
+# Logs
+*.log
+logs/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
