@@ -10,17 +10,24 @@ export default defineConfig({
     // https://vitepress.dev/reference/default-theme-config
     nav: [
       { text: 'Home', link: '/' },
-      { text: '文档', link: '/docs/test' },
-      { text: 'Examples', link: '/markdown-examples' }
+      { text: 'Go 学习', link: '/docs/go/' },
     ],
 
     sidebar: {
+      '/docs/go/': [
+        {
+          text: 'Go 学习笔记',
+          items: [
+            { text: '概览', link: '/docs/go/' },
+            { text: '主 Goroutine 的生与死', link: '/docs/go/3.6主Goroutine的生与死' }
+          ]
+        }
+      ],
       '/docs/': [
         {
           text: '文档',
           items: [
-            { text: '测试页面', link: '/docs/test' },
-            { text: '主 Goroutine 的生与死', link: '/docs/go/3.6主Goroutine的生与死' }
+            { text: '测试页面', link: '/docs/test' }
           ]
         }
       ],
