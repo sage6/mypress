@@ -5,6 +5,7 @@ export default defineConfig({
   base: '/mypress/',
   title: "liweidong's blog",
   description: "记录学习的一下笔记",
+  head: [['link', { rel: 'icon', href: '/mypress/favicon.svg' }]],
   themeConfig: {
     // https://vitepress.dev/reference/default-theme-config
     nav: [
