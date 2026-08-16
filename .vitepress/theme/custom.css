@@ -1,0 +1,12 @@
+.vp-doc .mermaid {
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: visible;
+}
+
+.vp-doc .mermaid svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+}

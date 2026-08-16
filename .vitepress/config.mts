@@ -1,11 +1,34 @@
 import { defineConfig } from 'vitepress'
+import { withMermaid } from 'vitepress-plugin-mermaid'
 
 // https://vitepress.dev/reference/site-config
-export default defineConfig({
+export default withMermaid(defineConfig({
   base: '/mypress/',
   title: "liweidong's blog",
   description: "记录学习的一下笔记",
   head: [['link', { rel: 'icon', href: '/mypress/favicon.svg' }]],
+  mermaid: {
+    flowchart: {
+      htmlLabels: true,
+      useMaxWidth: true
+    }
+  },
+  vite: {
+    optimizeDeps: {
+      include: [
+        'dayjs',
+        'mermaid',
+        '@braintree/sanitize-url',
+        'debug',
+        'cytoscape'
+      ]
+    },
+    build: {
+      commonjsOptions: {
+        include: [/dayjs/, /node_modules/]
+      }
+    }
+  },
   themeConfig: {
     // https://vitepress.dev/reference/default-theme-config
     nav: [
@@ -46,4 +69,4 @@ export default defineConfig({
       { icon: 'github', link: 'https://github.com/vuejs/vitepress' }
     ]
   }
-})
+}))
