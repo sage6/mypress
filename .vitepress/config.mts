@@ -48,6 +48,7 @@ export default withMermaid(
               { text: "3程序的生命周期", link: "/docs/go/3程序的生命周期" },
               { text: "4类型系统", link: "/docs/go/4类型系统" },
               { text: "5数据结构", link: "/docs/go/5数据结构" },
+              { text: "6函数延迟和恐慌", link: "/docs/go/6函数延迟和恐慌" },
             ],
           },
         ],
