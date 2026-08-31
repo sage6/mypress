@@ -49,6 +49,7 @@ export default withMermaid(
               { text: "4类型系统", link: "/docs/go/4类型系统" },
               { text: "5数据结构", link: "/docs/go/5数据结构" },
               { text: "6函数延迟和恐慌", link: "/docs/go/6函数延迟和恐慌" },
+              { text: "7错误处理", link: "/docs/go/7错误处理" },
             ],
           },
         ],
