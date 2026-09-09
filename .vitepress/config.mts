@@ -51,6 +51,7 @@ export default withMermaid(
               { text: "6函数延迟和恐慌", link: "/docs/go/6函数延迟和恐慌" },
               { text: "7错误处理", link: "/docs/go/7错误处理" },
               { text: "8泛型", link: "/docs/go/8泛型" },
+              { text: "9goroutine调度器", link: "/docs/go/9goroutine调度器" },
             ],
           },
         ],
