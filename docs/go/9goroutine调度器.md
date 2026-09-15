@@ -361,4 +361,350 @@ goroutine唤醒另外一个（如cahnnel收发）,被唤醒者会放进runnext�
 状态有这样几个：
 
 - `_Gidle`: 刚分配，尚未初始化；
-- `_Grunnable`:
+- `_Grunnable`: 在某个队列里面，等待被调度，尚未执行；
+- `_Grunning`: 正在某个M上执行用户代码，已绑定M与P;
+- `_Gsyscall`: 正在执行系统调用，尚未执行用户代码；
+- `_Gwaiting`: 阻塞运行时(如channel收发，`time.Sleep`，加锁)，不再运行队列上，需要显式唤醒
+- `Gdead`: 未被使用，可能是刚推出，也可能是待复用的空壳，缓存在`p.gFree / sched.gFree`;
+- `_Gcopystack`: 栈正在被搬迁，形似`_Gwaiting`， 但等待强占方负责把它转回`_Gwaitting`;
+- `_Gpreempted`: 因强占而自行停下，形似`_Gwaiting`, 但等待强占负责把它转回`_Gwaitting`;
+
+go1.26在此之上新增加了一个诊断状态`_Gleaked`（值10）。它不是声明周期的常规一环，而是GC给疑似的阻塞goroutine打的一个标记：GC扫描时候若发现某个`_Gwaiting`的goroutine已无法再被唤醒（
+不可达），便经`casgstatus(gp, _Gwaiting, _Gleaked)`将其标记为泄漏(`runtime/mgc.go`)；若它后来又变回可达，再经过`casgstatus(gp0,_Gleaked,_Gwaiting)`还原。它是覆盖在阻塞之上
+的一层诊断试图，运行时并不会就此回收该goroutine.
+
+驱动这些迁移的，是一组我们会反复遇到的运行时函数：`newproc`创建新G，`execute`上CPU,`gopark`主动阻塞，`goready`唤醒，`entersyscall/exitsyscall`退出系统调用，`goexit`退出。把它们
+标在边上，goroutine的一生如下：
+
+```mermaid
+stateDiagram-v2
+    direction LR
+
+    [*] --> Gidle: newproc 分配
+    Gidle --> Gdead: 置为 dead 壳
+    Gdead --> Grunnable: 初始化现场入队 / 复用 gFree
+
+    Grunnable --> Grunning: execute / schedule<br/>上 CPU
+    Grunning --> Grunnable: gosched<br/>主动让出
+
+    Grunning --> Gsyscall: entersyscall<br/>无 P，入队等候
+    Gsyscall --> Grunning: exitsyscall<br/>快速重获 P
+    Gsyscall --> Grunnable: exitsyscall<br/>无 P，入队等待
+
+    Grunning --> Gcopystack: 栈增长 / 收缩
+    Gcopystack --> Grunning: 搬迁完成
+
+    Grunning --> Gwaiting: gopark 阻塞<br/>(channel、锁、sleep)
+    Gwaiting --> Grunnable: goready 唤醒
+
+    Grunning --> Gpreempted: 抢占自停
+    Gpreempted --> Gwaiting: 抢占方接管
+
+    Gwaiting --> Gleaked: GC 判定泄漏
+    Gleaked --> Gwaiting: 重新可达，还原
+
+    Grunning --> Gdead: goexit 退出
+```
+
+新建一个goroutine的过程，正是这种图最初的几步：`newproc`先把G由`_Gidle`置为`_Gdead`并挂入`allg`（让GC知道但不扫描为初始化的栈），随后根据函数入口参数初始化执行与`gobuf`，再
+`casgstatus`为`_Grunnable`入队，等待`execute`把它推上CPU。状态还有一个与GC协作的`_Gscan`位族（如`_Gscanrunning`）,用于在不打断goroutine的前提下扫描其栈，为保持图的可读
+我们略去。细节见13垃圾回收。
+
+### 9.3.5 横向对照：别家的并发执行体
+
+把goroutine放回到同辈中看，9.3.1那套`有栈/无栈`的分类立刻显示出分量。下表对照集中语言的并发执行体，关键在于它们是否有独立栈，以及由此决定有没有函数热色问题：
+
+| 系统                         | 有栈？       | 表示形态                                 | 起步开销                      |
+| ---------------------------- | ------------ | ---------------------------------------- | ----------------------------- |
+| Go goroutine                 | 是           | 独立栈+gobuf延续，连续栈按需增长         | 处始栈2KB                     |
+| `Erlang/BEAM`进程            | 是           | 独立轻量进程，私有堆，调度于BEAM之上     | 数百字节量级                  |
+| Java虚拟线程（Loom,JEP 444） | 是           | 延续挂到载体线程（carrier）执行          | 按需要增长，远小于平台栈      |
+| Lua协程                      | 是（非对称） | 独立栈，`coroutine.resume/yield`显式让出 | 轻量,由解析器管理             |
+| Kotlin协程                   | 否           | suspend编译为CPS状态机，无独立栈         | 极小(仅状态对象),但有函数染色 |
+
+值得点出的是分类列。Go,Erlang,Java虚拟线程，Lua协程都是有栈的，因而没有函数染色问题：任意深度的调用都能挂起。Kotlin协程是无栈的，编译器把`suspend`函数翻成延续传递风格(CPS)的状态机，
+代价是`suspend`这种颜色会沿着调用链传染，正是9.3.1所说的Go用有栈设计避开的那道裂痕。Lua协程尤其值得一提：Moura与Ierusalimschy 2009年那篇奠定协程分类的论文，本就源自Lua的协程设计，
+goroutine的非对称有栈血统与它一脉相承，值时Go把显式的`resume/yield`藏进了运行时，让用户只看见go与channel。
+
+### 9.3.6 工作线程的暂停与复始
+
+最后回到承载G的工作线程M。调度器只要在两条相互拉扯的诉求间权衡：既要保持足够多的运行线程以吃满硬件并行度，又要暂止多余的线程以省下CPU能耗。用抽屉原理可以把这对张力说清楚：设进程中有n个M,
+用户创建了p个G，则当p > n时，必有 p - n个G暂时无M可跑（需要更多线程，即复始/unpack）；当p < n时，必有n - p个M无G可跑。（应当休眠，即暂止/park）。
+
+求这个权衡的最优解很难，难在两处。其一,多个M各持本地队列，彼此看不到对方的状态，这本质上是一个分布式系统：没有一个让所有线程同步的全局时钟，要在不加屏障的快路径上算出全局是否还有空闲工作。
+这样的全局谓词，按共识理论是做不到的。其二，最优的暂止决策需要未来信息：理想情况下，若知道协一刻有新的G就绪，就不该让现在去暂停一个M。但G合适就绪是随机的（设想一个Web服务，请求到达即创建
+G），无法预知。
+
+Go的解法是引入工作线程的自旋(spinning)状态：一个本地队列，全局队列，网络轮询器中都找不到工作的M，不能立刻睡去，而是先短暂自旋寻找工作。其要点是：
+
+1. 唤醒一个G时，先看是否已有自旋线程（`sched.nmspinning`），若不在有就额外复始新线程，让那个正在找活的线程接住即可；
+2. 仅当存在空闲P，且没有任何自旋线程时候，就绪一个G才复始一个新线程；
+3. 最后一个自旋线程找到工作，转为非自旋的时候，再复始一个新线程顶上；
+
+这套规则消除了不合理的线程复始尖峰，又保住了CPU并行度的上限。可以把它想象成银行服务台：身手敏捷的顾客（自旋的M）随时 奔向任何空出来的窗口（待运行的G），只有当所有人就位，却仍有窗口空着时候，
+才请一个新顾客进场。
+
+实现的微妙之处全在自旋和非自旋的状态切换必须无缝衔接，否则就会在提交新G与线程转为非自旋之间撞出竞争，最终双方都以为对方会处理，结果谁都没处理，留下CPU利用不足的尾巴。为此两侧都要插入一道
+`StoreLoad`风格的屏障：就绪一个G的时候，先把G入本地队列，再屏障，再检查`nmspinning`；线程转非自旋的时候，先减`nmspinning`，再屏障，再回扫所有本地队列确认确无遗漏的工作。两道屏障的
+检查彼此交叉，保证不会有刚提交的G无人认领的窗口。值得一提的是，这套复始逻辑只对每个P的内地队列适用，想全局队列提交工作的时候不会出发线程复始.
+
+至此，三个调度单元与承载它们的线程都已经就位：G是被调度的有栈线程，M是出力的线程，P是连接二者，携带本地资源的许可证。它们如何在每一次调度循环里协同运转，是9.4调度循环与9.5工作窃取的主题。
+
+## 9.4 调度循环
+
+前面几节备齐了材料:知道了G, M, P是什么(9.3)。知道了一个M怎么找活儿（9.2）。这一节把它们真正转起来，看调度循环如何在一个线程上一刻不停地挑选并运行goroutine，以及它如何在让当个goroutine跑
+得久一点（吞吐与局部性）与别让任何goroutine饿死直接拿捏分寸。
+
+下文的代码一律是裁剪后的速写，只保留与设计相关的骨架，去掉GC，tracing, profiling,锁定线程等旁支。完整定义可对照`runtime/proc.go`，下文涉及的版本均为go1.26。
+
+### 9.4.1 一个用不返回的循环
+
+Go的调度是协作式，运行到让出（run-to-yield）的：一个goroutine一旦被选中，就一直跑到它主动让出，阻塞，或者被抢占为止，而不像内核那样被时钟中断按固定时间片走。每个工作线程从mstart启动后，
+最终进入调度循环`schedule`，此后在其中周而复始，指导线程退出。骨架剥到最简,就是一个两步循环：
+
+```go
+// 每个M的调度循环（速写）：运行在系统栈g0上，用不返回
+func schedule() {
+    // 找一个可运行的G(见9.2的完整顺序)；找不到就阻塞在findRunable内，直到有活儿
+    gp, inheritTime, _ := findRunnable()
+
+    // 切换到gp的栈开始执行。控制权要再回到这里，靠的是下面的mcall,而非函数返回
+    execute(gp, inheritTime)
+}
+```
+
+`findRunnable`用不返回nil:取不到活儿，它会让M转入自旋或者休眠，阻塞在内部知道被唤醒，因此`schedule`不必处理无事可做的分支。而`execute`也用不返回，它跳进用户G的栈，此后`schedule`这
+一帧的栈空间就被复用额。控制权要回到调度逻辑，靠的是9.4.2的栈切换。
+
+```mermaid
+flowchart TD
+    A["mstart<br/>线程启动"]
+    B["schedule 在 g0 上挑选<br/>一个 G"]
+    C["findRunnable:<br/>runnext / 本地 → 全局<br/>→ 网络 → 窃取"]
+    D["execute: casgstatus<br/>转 _Grunning"]
+    E["gogo<br/>切到该 G 的栈"]
+    F["G 执行用户代码"]
+    G["自旋 / stop 睡眠<br/>被唤醒后重试"]
+    H["mcall<br/>切回 g0，执行回调"]
+    I["goexit → goexit0<br/>回收 G 到 gFree"]
+
+    A --> B
+    B --> C
+
+    C -- "取到" --> D
+    C -- "取不到" --> G
+
+    G -- "重试" --> C
+
+    D --> E
+    E --> F
+
+    F -- "阻塞 / Gosched / 被抢占" --> H
+    H --> B
+
+    F -- "函数返回" --> I
+    I --> B
+```
+
+`schedule`与`findRunnable`这些调度跑在M的专用系统栈上g0上（9.3）,不在用户G的栈上。这些带来清晰的分工：`g0`负责调度，用户G负责干活。也因为如此，`schedule`从不真正返回，它选中一个G，跳
+过去执行，控制权要回到调度逻辑，靠的是下一节的栈切换，而非函数返回。
+
+### 9.4.2 两次切换：execute与mcall
+
+调序循环里面有两个方向相反的栈切换，他们合起来构成9.3那种goroutine状态机的物理实现：状态机说会发生哪些迁移，这两个例程说迁移回符合发生。
+
+从g0跳到用户G：schedule选出G后调用execute。它先把G切回到`_Grunning`，绑定当前M,再调用汇编例程`gogo`，由后者把G保存现场（9.3的gobuf：sp,pc,bp等）装回寄存器，控制权便落到用户G的栈上，
+从它上次被切下处继续。
+
+```go
+// 在当前M上执行gp(速写)
+func execute(gp *g, inheritTime bool) {
+    mp := getg().m
+
+    mp.curg = gp // M与G相互引用
+    gp.m = mp
+    casqstatus(gp, _Grunnable, _Grunning) // 状态机迁移
+    gp.preempt = false
+    gp.stackguard0 = gp.stack.lo + stackGuard
+    if !inheritTime {
+        mp.p.ptr().schedtick++  // 开新的时间片才计数;继承时间片不计 (见9.4.3)
+    }
+    gogo(&gp.sched) // 装回gobuf,跳到gp的栈，永不返回
+}
+```
+
+gogo的精巧之处在于它有去无回：装回寄存器后直接JMP到G的pc，没有任何返回调度器的代码。第一次执行一个新G时，它的pc指向用户函数fn，而fn的返回地址在newproc1建栈的时候被置成了goexit(见9.4.4)。
+于是fn一旦return,自然就落到了goexit，这正是控制权回到运行时的入口。
+
+从用户G跳到g0：G要让出时（Gosched，阻塞在channel，被抢占，或者函数执行完毕）,最终都调用mcall。它把当前现场存进G的gobuf，切到g0栈，在g0上执行一个回调：
+
+```go
+// mcall(fn)(语意速写):保存当前G现场，切到g0，在g0上执行fn(gp)
+// 1. 把调用方pc/sp存入gp.sched
+// 2. 切换sp到m.g0栈
+// 3. 调用fn(gp), fn必须永不返回(它最终会回到schdule)
+```
+
+回调因让出的原因各异：主动让出走`goschedImpl`,它把G重新挂回队列后续`schedule`;阻塞等待走`park_m`，把G置为`_Gwaitting`后再`schedule`；执行完毕走`goexit0`。无论哪条，回调干完都回到
+`schedule`，循环就此闭合。这一来一回，正是goroutine再正在执行与其他状态之间迁移的物理实现。
+
+```mermaid
+sequenceDiagram
+    participant G0 as g0（调度栈）
+    participant G as 用户 G
+
+    G0->>G: execute → gogo<br/>装回 gobuf，切到 G 栈
+    Note over G: G 运行用户代码
+
+    G->>G0: mcall<br/>保存现场，切回 g0 栈
+    Note over G0: 在 g0 上执行回调<br/>gосchedImpl / park_m / goexit
+
+    G0->>G0: 回到 schedule<br/>挑选下一个 G
+    G0->>G: execute → gogo<br/>切换到下一个 G
+```
+
+### 9.4.3 公平：不让任何人饿死
+
+协作式调度有一个内在的风险：若总让本地最顺手的G先跑，某些G可能永远排不上队。schedule为此布了几道公平的阀门，他们合起来才让协作调度再实践中不至于饿死任何人。
+
+全局队列的周期性检查。findRunnable再动用本地队列之前，每隔61次调度就会先去全局队列中取一个G：
+
+```go
+// findRunnable中公平阀门(速写)
+if pp.schedtick%61 == 0 && !sched.runq.empty() {
+    lock(&sched.lock)
+    go := globrunqget() // 从全局对了取一个，绕过本地队列
+    unlock(&sched.lock)
+    // ... 取到则直接返回
+}
+```
+
+它解决一个具体的饥饿场景：两个互相唤醒对方的G会在本地队列里面你来我往，把本地队列沾满，使全局队列里面的G迟迟得不到执行。隔固定次数强制看一眼全局队列，就打破这种垄断。注意计数器用的是
+schedtick，它只是在开启新的时间片时自增（见9.4.2的execute），继承时间的runnext不计入，因此61次量的是真正开新片的调度，而非每一次G切换。源码注释只解释了为保证公平，并未说明为何偏偏
+是61，流传甚广的61是质数，可避免共振之说属于民间推测，本书只取61这个事实。
+
+runnext的反饥饿约束。刚被唤醒，或刚被go派生的G会被放进P的runnext槽优先运行，并继承当前时间片的剩余时间(inheritTime，见9.4.2中runqget返回的第二个值)。这让通信即运行的一对goroutine能
+作为一个单元被紧凑调度，利于缓存局部性。但是runnext也可能被滥用成两个G相互runnext对方，霸占CPU。运行时依赖sysmon（9.8）按时间片来抢占兜底。源码里面有一处耐人寻味的细节：当目标平台没有
+sysmon（如wasm）,运行时会彻底禁用runnext:
+
+```go
+// runqput(速写):把gp放进本地队列;next为真则放进runnext槽
+func runqput(pp *p, gp *g, next bool) {
+    if !haveSysmon && next {
+        // runnext与当前G共享同一时间片(inheritTime)
+        // 没有sysmon抢占兜底时，一对相互runnext的G回饿死其他所有人
+        // 故此时必须放弃runnext。
+        next = false
+    }
+    // ... next为真 CAS进pp.runnext，否则入队列尾；队列满则溢出全局队列
+}
+```
+
+这是一处很说明问题的设计：公平不是单点机制，而是多处协同的效果。runnext带来吞吐与局部性,代价是潜在的乒乓饥饿；这份代价由`sysmon`的抢占来对冲；一旦抢占这条腿就不在，带来吞吐的那条腿也必须收
+回。
+
+挑选的完整顺序仍然是9.2给出的那条，按命中频率从高的低，同步代价是从低到高排列：
+
+```mermaid
+flowchart LR
+    A["runnext + 本地队列<br/>（每个 P 无锁）"]
+    B["全局队列<br/>（加 sched.lock）"]
+    C["网络轮询器 netpoll<br/>（就绪的 I/O goroutine）"]
+    D["从其他 P 窃取<br/>（随机选目标 P，偷一半）"]
+    E["全落空：转自旋 /<br/>stopm 休眠"]
+
+    A --> B --> C --> D --> E
+```
+
+只有全部落空，线程才转入自旋（短暂忙等，堵很快就有活儿）或经stopm休眠。这条先本地，再全局，末了窃取的顺序，本身就是吞吐与公平的折中：靠前的步骤廉价且有利于局部性，靠后的步骤保证活儿最终会被
+某个空闲的M捡走。
+
+### 9.4.4 goroutine的诞生和消亡
+
+循环之外还有两端。
+
+诞生。`go f()` 经编译器翻译作为队newproc的调用，它咋系统栈上完成建G的工作：
+
+```go
+// newproc（速写)： go f() 的落地
+func newproc(fn *funcval) {
+    gp := getg()
+    pc := sys.GetCallerPC()
+    systemstack(func() {
+        newg := newproc1(fn, gp, pc, false, waitReasonZero) // 见下
+
+        pp := getg().m.p.ptr()
+        runqput(pp, newg, true) // next = true: 放进runnext，让新的G优先且就近执行
+        if mainStarted {
+            wakep()  // 若有空闲P且睡着的M,唤醒一个来增加并行度
+        }
+    })
+}
+```
+
+newproc1是真正建G的地方，它体现了复用优先的思路： 先从P的空闲列表gFree取一个用过的G（连同它的栈）,取不到才推向新的分配；随后清零现场，把`sched.pc`指向用户函数，把fn的返回地址预设置为
+goexit（这正是9.4.2里面gogo跳进去能自然落到goexit的原因）,最后把G置为`_Grounable`。`runqput(pp, newg, true)`让刚派生的G进入runnext，使用派生即运行的常见模式跑的紧凑；wakep则在
+有富余并行度时叫醒一个M，把新G尽快变成正真的并行。
+
+消亡。G的函数返回并不直接回到调用者，而是落到运行时预置的goexit,经`goexit1 -> mcall(goexit0)`切回到g0，由goexit0收尾：
+
+```go
+// goexit0(速写):在g0上回收一个跑完的G
+func goexit0(gp *g) {
+    casgstatus(gp, _Grunning, _Gdead) // 状态机迁移:运行中 -> 死亡
+    // ...清理gp的字段：defer，panic，label，与M的绑定等
+    dropg()     // 解绑M与G
+    gfput(pp, gp)       // 把G（连同栈)挂回P的gFree供复用
+    schedule()      // 回到调度循环,永不返回
+}
+```
+
+G不被释放而是回收进gFree，避免了反复分配G结构体与初始栈。这是高频创建goroutine仍然廉价的原因之一：第二次起的`go f()`多半是从gFree摘一个旧的G,改一改入口，而非从零构造。诞生从gFree取，
+消亡往gFree还，两端对称地共用同一个每P的空闲池，与分配器的每P缓存是同一种分层减争的招式。
+
+### 9.4.5 设计的演进
+
+今天这套循环不是一开始就长成这样的，它的几道阀门各自对应历史上的一处教训。把演进的脉络摆出来，前面那些看似随意的常数与约束就有了由来。
+
+```mermaid
+flowchart LR
+    A["Go 1.0 之前<br/>单一全局 runq + 一把大锁"]
+    B["Go 1.1<br/>每个 P 本地队列<br/>+ 工作窃取 + 自旋 M"]
+    C["逐步加入<br/>局部性优化 + 反饥饿"]
+    D["Go 1.14<br/>异步信号抢占"]
+
+    A -->|"Vyukov 重设计 2012"| B
+    B -->|"runnext + 61 阀门"| C
+    C -->|"提案 24543"| D
+```
+
+最早的调度器（Go 1.0以及之前）只有一个全局队列，配一把全局锁。所有M取G,放G都要争取这把锁，核数一多便成了瓶颈。Vyukov在2012年的设计文档里面正是从这个痛点起笔，提出每个P一个本地队列，辅以
+工作窃取与自旋M的方案，随着Go 1.1落地。这一步奠定了9.2与本节的全部基础：本地队列让绝大多数取放无锁，窃取保证活儿不会困到某个P上，自旋M则在唤醒新线程的昂贵操作之前先忙一会儿，堵很快有活儿来。
+
+本地队列解决了争用，却引出了公平问题，于是有了9.4.3的两道补丁：runnext槽位通信即运行的一对G争取局部性，61次的全局队列检查则堵住了互相唤醒的一对G垄断本地队列的漏洞。它们是在本地队列方案稳定
+之后，针对其副作用逐步打上的。
+
+最后一块拼图是抢占。早期的抢占是协作式的，只在函数序言的栈检查点上发生，一个没有函数调用的紧凑循环（如`for {}`）会一直占着P不让出，连STW都会被它无限制拖住。Go 1.14引入基于信号的异步抢占
+（提案24543），运行时的目标线程发出信号，在安全点上强行夺回控制权，这才补充上协作式调度最后的窟窿，也正是9.3里的runnext敢于依赖的那条兜底。
+
+### 9.4.6 放到调度理论里看
+
+把schedule的几道阀门收集起来。Go的调度时运行到让出+协作让权+信号抢占兜底的一种混合。它落在调度设计的谱系中间地带。
+
+纯协作式调度（早期的用户态线程，Node的事件在单个任务内部）,吞吐高，切换廉价，因为让权点由程序员自己掌控，无需保存完整的终端线程；代价是一个不让权的任务能拖垮全局，公平全靠程序自觉。纯时间片
+抢占（内核线程）公平且不依赖任务配合，代价是切换昂贵，且抢占点不可控，不利于局部性。
+
+Go取两者之间：默认靠协做让权（channel,Gosched,函数序言里面的抢占检查）与工作窃取(9.2)获取吞吐与局部性，再用sysmon驱动的，约10ms一次的异步抢占位公平兜底，确保没有让权点的纯计算G也被
+切走。9.4.3里面没有sysmon就关掉runnext的细节，正是这套混合的内在逻辑外漏：抢占这条腿一旦缺席，依赖它兜底的协作优化也得跟着退场。
+
+这与Erlang/BEAM的归约计数抢占异曲同工。BEAM给每个进程一份固定的预约演算（reduction budget）,每次函数调用等操作扣一次，预算耗尽即被换下。两者都在协作的廉价与抢占公平之间平衡，分野只在
+抢占点放在哪里：Go把它放在函数调用的栈检查与异步信号上，BEAM放在归约计数上。BEAM的计数是确定的，与时间无关的，公平粒度更均匀；Go的信号抢占按照真实时间触发，实现更轻，对GC安全点的配合更自然
+。没有完美的调度，schdule这几道阀门，就是Go在吞吐，延迟与实现复杂度之间给出一个具体而克制的答案。
+
+## 9.5 线程管理
+
+9.1立下了GMP的三层结构：G是用户态的执行单元，P是调度的许可证与本地资源，M才是真正的操作系统借来的那条腿。前几节谈G与P居多，这一节把目光落到M上，回答几个被一直搁置的问题：M到底是什么，它
+从哪里来，为什么GOPAXPROCS限的是P而非线程常常多于它，一次阻塞的系统调用为何不会把别的G一同拖死，以及用户想把一个Goroutine钉死在某个线程上时（LockOSThred）,运行时为此要付出什么代价。
+
+贯穿全节的一个判断是:线程是昂贵的资源。创建它要陷入内核，要分配栈，要登记信号掩码；销毁它同样不便宜。Go调度器的需要设计，从复用空闲M,到把系统调用中的P交接出去，再到给线程数量一道一万的保险
+丝，都是围绕着尽量少创建，尽量多复用这一条主线展开的。
