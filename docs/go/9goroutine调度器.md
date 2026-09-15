@@ -708,3 +708,28 @@ Go取两者之间：默认靠协做让权（channel,Gosched,函数序言里面�
 
 贯穿全节的一个判断是:线程是昂贵的资源。创建它要陷入内核，要分配栈，要登记信号掩码；销毁它同样不便宜。Go调度器的需要设计，从复用空闲M,到把系统调用中的P交接出去，再到给线程数量一道一万的保险
 丝，都是围绕着尽量少创建，尽量多复用这一条主线展开的。
+
+### 9.5.1 M即操作系统线程
+
+M(machine)是一对操作系统线程的抽象。进程启动时，引导线程被包装成m0，它是全局变量，随进程一同存在，不经过堆分配；此后每一个M都对应一条由运行时显式创建的内核线程。M与G的关系是线程跑
+Goroutine：M持有一个P后，从P的本地队列里面取G来执行。裁剪后的速写只与线程管理相关的字段：
+
+```go
+// m: 一条操作系统线程运行时抽象（速写）
+type m struct {
+    g0 *g   // 调度用的系统栈goroutine：跑调度器的代码，处理信号。
+    curg *g // 当前正在次M上执行的用户goroutine
+    p puintptr  // 当前持有的P;进入系统调用时候可能被剥离
+    nextp puintptr  // 被唤醒后将要绑定的P(stopm醒来时用)
+    oldp puintptr   // 进入系统调用前持有的P,留待exitsyscall快速取回
+
+    park    note    // 线程在此信号量上睡眠/唤醒,复用M的核心机制
+    schedlink muintptr // 串如空闲M链表/newHandoff链表
+
+    lockedg guintptr // 与某个G互锁（lockOSThread),见9.5.6
+    lockedExt int32 // 外部（用户）锁定计数
+    lockedInt int32 // 内部(用户)锁定计数
+    incgo bool  // 是否正执行cgo调用
+    isextra bool    // 是否为cgo回调而生的extra-M，见9.5.5
+}
+```
