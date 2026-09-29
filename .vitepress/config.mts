@@ -52,6 +52,7 @@ export default withMermaid(
               { text: "7错误处理", link: "/docs/go/7错误处理" },
               { text: "8泛型", link: "/docs/go/8泛型" },
               { text: "9goroutine调度器", link: "/docs/go/9goroutine调度器" },
+              { text: "10通道与select", link: "/docs/go/10通道与select" },
             ],
           },
         ],
