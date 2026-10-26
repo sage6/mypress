@@ -54,6 +54,7 @@ export default withMermaid(
               { text: "9goroutine调度器", link: "/docs/go/9goroutine调度器" },
               { text: "10通道与select", link: "/docs/go/10通道与select" },
               { text: "11同步原语模式", link: "/docs/go/11同步原语模式" },
+              { text: "12内存分配器", link: "/docs/go/12内存分配器" },
             ],
           },
         ],
