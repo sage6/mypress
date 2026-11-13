@@ -56,6 +56,7 @@ export default withMermaid(
               { text: "11同步原语模式", link: "/docs/go/11同步原语模式" },
               { text: "12内存分配器", link: "/docs/go/12内存分配器" },
               { text: "13垃圾回收器", link: "/docs/go/13垃圾回收器" },
+              { text: "14执行栈管理", link: "/docs/go/14执行栈管理" },
             ],
           },
         ],
