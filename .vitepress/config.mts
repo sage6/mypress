@@ -57,6 +57,7 @@ export default withMermaid(
               { text: "12内存分配器", link: "/docs/go/12内存分配器" },
               { text: "13垃圾回收器", link: "/docs/go/13垃圾回收器" },
               { text: "14执行栈管理", link: "/docs/go/14执行栈管理" },
+              { text: "15编译器与流水线", link: "/docs/go/15编译器与流水线" },
             ],
           },
         ],
